@@ -1,1 +1,8 @@
 **/.terraform/**
+
+# Windows NTFS alternate data streams (leak through WSL when files are copied from Windows)
+*:Zone.Identifier
+*:MSOAVINFO
+
+# External reference docs — not for publication
+Edgar x Lemon.markets.pdf

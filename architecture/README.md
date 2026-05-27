@@ -1,175 +1,226 @@
-# Innovate Inc. — Cloud Architecture Design
+# Innovate Inc. — Cloud Architecture Proposal
 
-**Cloud:** AWS
-**Date:** 2026-05-26
-**Status:** Proposed (v1.0)
+A proposal for a robust, scalable, secure, and cost-effective AWS architecture for Innovate Inc.'s web application.
 
-This document describes the target AWS architecture for Innovate Inc.'s web application (React SPA + Python/Flask REST API + PostgreSQL). It is sized to start small (hundreds of users/day) and scale to millions without re-architecting, while meeting the security bar required for sensitive user data.
-
-The companion Terraform skeleton in [`../terraform/`](../terraform/) already provisions the EKS + Karpenter foundation that this design builds on.
+Davit Madoyan · May 2026
 
 ---
 
-## Table of contents
+## EXECUTIVE SUMMARY
 
-1. [Why AWS](#1-why-aws)
-2. [Cloud environment structure (multi-account)](#2-cloud-environment-structure-multi-account)
-3. [Network design (VPC)](#3-network-design-vpc)
-4. [Compute platform (EKS + Karpenter)](#4-compute-platform-eks--karpenter)
-5. [Containerization & CI/CD](#5-containerization--cicd)
-6. [Database (Aurora PostgreSQL)](#6-database-aurora-postgresql)
-7. [Security & compliance posture](#7-security--compliance-posture)
-8. [Observability](#8-observability)
-9. [Cost posture & growth roadmap](#9-cost-posture--growth-roadmap)
-10. [High-level diagrams](#10-high-level-diagrams)
+### What This Document Covers
+
+This document outlines my proposed cloud architecture for Innovate Inc.: a React SPA + Python/Flask REST API backed by PostgreSQL, handling sensitive user data, deployed on AWS with managed Kubernetes. The goal is an environment that runs comfortably at hundreds of users per day on day one and scales to millions without re-architecting, while meeting the security bar that "sensitive user data" demands.
+
+I am not proposing a theoretical reference architecture. It is shaped by what already exists in this repository — the Terraform under [`../terraform/`](../terraform/) already provisions EKS with Karpenter on AWS — and by the realities of a small startup: limited operations capacity, a need to be cost-aware, and a roadmap that must survive 100× growth.
+
+I am also not proposing a perfect system on day one. I am proposing a foundation that does not need to be rebuilt later. Where I defer a decision (Aurora Serverless v2 for prod, multi-region active-active, a `staging` account), I name the trigger that should bring it back.
 
 ---
 
-## 1. Why AWS
+## ASSUMPTIONS
 
-Both AWS and GCP can deliver this workload well. We recommend **AWS** for Innovate Inc. because:
+### What I Am Assuming
 
-- **EKS + Karpenter** is mature and is what this repository already provisions, so day-zero engineering effort is the lowest.
-- **Aurora PostgreSQL** offers stronger managed-Postgres features than the GCP equivalent for our needs: a decoupled storage layer with 6-way replication, fast in-place failover (~30 s), Global Database for cross-region DR, and Aurora Serverless v2 for cost-efficient non-prod environments.
-- **AWS Organizations + Control Tower** gives a well-trodden, auditable multi-account blueprint that scales from a 5-person startup to an enterprise without rework.
-- **Marketplace + AWS-native primitives** (KMS, WAF, Shield, GuardDuty, Security Hub, Secrets Manager) cover the sensitive-data compliance story with minimal third-party glue.
+Before going into specifics, I want to call out the assumptions I am working with. These are based on the problem description and what is already in the repository.
 
-The same shape (managed K8s + managed Postgres + multi-project isolation) would be valid on GCP (GKE Autopilot + AlloyDB or Cloud SQL); the recommendation is preference, not exclusion.
+- **AWS is the cloud.** The existing Terraform is on AWS (EKS + Karpenter), and GCP would not deliver enough advantage to justify a cross-cloud rebuild. I cover the GCP comparison briefly in [Tradeoffs](#tradeoffs).
+- **The team is small to start** (3–10 engineers). The design must be operable by a few people, not a dedicated platform team. Wherever I add a managed service, it is partly to avoid hiring someone to run the unmanaged version.
+- **Sensitive user data is in scope** but no specific compliance regime (SOC 2 / PCI / HIPAA) is firm yet. I design to the *spirit* of all of them — encryption, audit logging, least privilege, immutable trails — without claiming certification.
+- **Primary region is `us-east-1`, DR region is `us-west-2`.** Confirm based on user geography. Switching is cheap if done before launch.
+- **Innovate Inc. uses Google Workspace or Entra ID today** for email/calendar. Both can act as the SSO identity source. If they use something else, the IdP changes but the architecture does not.
+- **Aiming for ~99.9% availability** on launch, with headroom to push to 99.95%+ once active-active multi-region is in place.
+- **Development and staging environments will exist.** Staging starts as a namespace in the dev account; it is promoted to its own account once that distinction matters (regulator, release manager, or real risk of cross-contamination).
+
+If any of these are wrong, the design needs revisiting before implementation — I'd rather find out now than after the Terraform applies.
 
 ---
 
-## 2. Cloud environment structure (multi-account)
+## CURRENT STATE
 
-We use **AWS Organizations with Control Tower**, landing zones managed as code. Even at startup scale, multi-account isolation is the single highest-leverage security and operational decision — accounts are the only true blast-radius boundary in AWS.
+### What Innovate Inc. Is Solving For
 
-### Initial account layout (6 accounts)
+Innovate Inc. is a small startup with limited cloud experience, building a web app that handles sensitive user data and expects to grow from hundreds of users to millions. The combination is what makes this interesting:
+
+**A startup-shaped operational budget.** A 5-person team cannot run a dedicated SRE rotation, manage their own Postgres, or staff a 24/7 incident response. The architecture has to lean on managed services aggressively.
+
+**An enterprise-shaped security bar.** Sensitive user data means strong encryption, full audit trails, least-privilege access, and threat detection from day one. "We'll add security later" is not viable here — retrofitting CloudTrail, KMS, and multi-account isolation onto a running system is painful and expensive.
+
+**A growth curve that crosses two thresholds.** Hundreds of users per day is comfortable on almost any setup. Millions of users per day is a different system. The architecture has to start cheap, but every decision should be checked against "does this survive 100× traffic?"
+
+**CI/CD as a baseline expectation.** Not optional — manual deploys are how startups acquire prod incidents.
+
+These four constraints push the design toward: managed everything (EKS, Aurora, ACM, Secrets Manager), multi-account from day one (cheap to do now, painful to retrofit), Spot + Graviton everywhere (cost lever that compounds), and a GitOps pipeline (so the deploy mechanism scales without becoming a bottleneck).
+
+---
+
+## APPROACH
+
+### How I Think About This
+
+The biggest leverage point for a small team is **picking the right boundaries and letting AWS run as much as possible inside them**.
+
+The boundaries I care about most:
+
+1. **Account boundary** — the only true blast-radius boundary in AWS. Worth getting right on day one, even at 5 people, because the cost is one Control Tower setup and the cost of *not* having it is a painful Series-A migration.
+2. **Network boundary** — public, app, data subnets. Default-deny everything; allow only what the architecture requires.
+3. **Identity boundary** — humans go through SSO with short-lived credentials, workloads go through IAM roles bound to pods or CI jobs. No long-lived keys anywhere.
+4. **Image boundary** — only signed, scanned images run in prod. The admission controller is the last gate.
+
+Inside those boundaries, AWS runs the things small teams do badly: Postgres replication and failover (Aurora), node lifecycle (Karpenter), TLS certificate rotation (ACM), secret rotation (Secrets Manager), DDoS mitigation (Shield), threat detection (GuardDuty).
+
+I also stage decisions over time. Some things I want on day one (multi-account, KMS everywhere, signed images, Aurora Multi-AZ). Some I defer until a clear trigger fires (Aurora Global Database, Shield Advanced, Network Firewall, a dedicated `staging` account, Okta). The point is not to build the smallest possible system or the largest possible system — it is to build the right *shape*, sized for today and ready to grow.
+
+The diagrams in [High-Level Diagrams](#high-level-diagrams) show the target state. The rest of this document walks through each layer.
+
+---
+
+## CLOUD ENVIRONMENT
+
+### Multi-Account Structure
+
+I am proposing **AWS Organizations with Control Tower** and six accounts on day one. The accounts are cheap; the structure is hard to retrofit.
 
 | Account | OU | Purpose |
 |---|---|---|
-| `innovate-management` | Root | Org root. Billing consolidation, Control Tower, IAM Identity Center (SSO). No workloads. |
-| `innovate-security` | `Security` | GuardDuty / Security Hub / Config / IAM Access Analyzer delegated administrator. Read-only auditor role assumable from any account. |
-| `innovate-log-archive` | `Security` | Immutable destination for CloudTrail, VPC Flow Logs, ELB / WAF / Aurora logs. Object Lock + cross-region replication. |
-| `innovate-shared-services` | `Shared` | ECR registries, Route 53 public zones, ACM certs in `us-east-1` for CloudFront, build runners, internal tooling. |
-| `innovate-dev` | `Workloads/Non-Prod` | Dev EKS cluster + Aurora. Lower limits, ephemeral databases, generous developer access. |
-| `innovate-prod` | `Workloads/Prod` | Production EKS cluster + Aurora. Locked-down access via break-glass + change tickets. |
+| `innovate-management` | Root | Org root, billing consolidation, Control Tower, IAM Identity Center. No workloads. |
+| `innovate-security` | Security | Delegated admin for GuardDuty / Security Hub / Config / IAM Access Analyzer. Read-only auditor role. |
+| `innovate-log-archive` | Security | Immutable destination for CloudTrail, VPC Flow Logs, ELB / WAF / Aurora logs. Object Lock + cross-region replication. |
+| `innovate-shared-services` | Shared | ECR registries, Route 53 public zones, CloudFront + its ACM cert, build runners, internal tooling. |
+| `innovate-dev` | Workloads/Non-Prod | Dev EKS cluster + Aurora dev. Generous developer access. Staging lives here as a namespace until it earns its own account. |
+| `innovate-prod` | Workloads/Prod | Production EKS + Aurora. Access via SSO + break-glass + change tickets. |
 
-Staging is a namespace inside `innovate-dev` initially; it gets promoted to its own account (`innovate-staging`) once we have a release manager or a regulator who requires production-like isolation for pre-prod testing.
+**Why six accounts, not one.**
 
-### Why this layout
+Account is the strongest isolation boundary AWS offers. A compromised IAM role in dev cannot reach prod. Billing is split cleanly without tagging hygiene. Service quotas are per-account, so a runaway dev workload cannot starve prod. CloudTrail flows to `log-archive` with Object Lock; even the org root admin cannot tamper with the audit trail.
 
-- **Isolation** — A compromised IAM role in `dev` cannot reach `prod` data. Resource-based policies in `prod` reject principals from other accounts by default.
-- **Billing** — Each account is a separate billing line in Cost Explorer. "How much does dev cost?" is a one-click question, not a tagging-hygiene exercise.
-- **Quotas** — Service quotas (Lambda concurrency, EC2 vCPU, etc.) are per account. Prod gets its own headroom; a dev runaway can't starve prod.
-- **Auditability** — All CloudTrail events flow to `log-archive` with Object Lock; even the org root admin cannot tamper with the audit trail.
-- **Future-proof** — Adding `staging`, `data`, or a per-customer account later is a Control Tower operation, not a migration.
+**Why Control Tower.**
 
-### Access
+Control Tower gives a pre-built landing zone — CloudTrail enabled org-wide, baseline guardrails (SCPs and Config rules), Account Factory for provisioning new accounts consistently, and a compliance dashboard. The alternative is a checklist that someone has to remember every time a new account is created, which fails at exactly the moment it matters (when the team is rushing).
 
-- **AWS IAM Identity Center (SSO)** federated to Innovate Inc.'s Google Workspace or Entra ID. No long-lived IAM users for humans.
+Control Tower is somewhat opinionated, but for a startup, the opinionation is a feature. Terraform still drives everything that lives *inside* the accounts; Control Tower owns the account-creation step and the org-wide baselines.
+
+**Identity.**
+
+- **AWS IAM Identity Center (SSO)** federated to Google Workspace or Entra ID. Humans log in once, assume temporary credentials (max 12 h), and get role-scoped access in each account.
 - **Permission sets** per role: `Developer-NonProd`, `Developer-ProdReadOnly`, `SRE-Prod-BreakGlass` (MFA + approval), `Auditor-ReadOnly`.
-- **Workload access** to AWS APIs goes through **IAM roles for service accounts** (IRSA) or **EKS Pod Identity** — pods get scoped, short-lived credentials, never static keys.
+- **Workloads** authenticate via IRSA or EKS Pod Identity. No static keys in pods, no static keys in CI.
+- **IdP migration path** — as Innovate adopts more SaaS tools (GitHub, Datadog, Slack, Snowflake, etc.), the identity source should migrate from Google Workspace to **Okta**. Okta is purpose-built as an IdP with a large app catalog, stronger lifecycle automation, and a richer policy engine. Identity Center stays in place; only the upstream IdP changes, which is a low-risk migration.
 
 ---
 
-## 3. Network design (VPC)
+## NETWORK
 
-Each workload account gets one VPC per region per environment. Identical Terraform module across accounts; only CIDR and tags differ.
+### VPC and Edge Security
 
-### Topology
+Each workload account gets one VPC per region per environment, from the same Terraform module. Only the CIDR and tags differ.
 
-- **CIDR**: `10.10.0.0/16` (dev), `10.20.0.0/16` (prod), non-overlapping so we can peer or use Transit Gateway later.
-- **Three Availability Zones** — minimum for Aurora multi-AZ and EKS control-plane resilience.
+**Topology.**
+
+- CIDRs are non-overlapping (`10.10.0.0/16` dev, `10.20.0.0/16` prod) so I can peer them or attach a Transit Gateway later without re-IP'ing.
+- **Three AZs** — minimum for Aurora Multi-AZ and EKS control-plane resilience.
 - **Four subnet tiers per AZ** (12 subnets per VPC):
-  - **Public** (`/24`) — only NAT gateways and the public-facing AWS Load Balancer Controller-managed NLB/ALB live here.
-  - **Private — apps** (`/22`) — EKS worker nodes (managed node group + Karpenter-provisioned).
-  - **Private — data** (`/24`) — Aurora, ElastiCache, etc. No route to the internet. No NAT route.
-  - **Private — egress** (`/26`) — reserved for future egress filtering (e.g. Network Firewall) without re-IP'ing.
+  - **Public** — only NAT gateways and the public ALB live here.
+  - **Private — apps** (the largest, `/22`) — EKS worker nodes. Sized for per-pod ENIs from the VPC CNI; running out of IPs here is a real failure mode at scale.
+  - **Private — data** — Aurora, ElastiCache. No route to the internet.
+  - **Private — egress** — reserved for future egress filtering (Network Firewall) without re-IP'ing.
 
-  The app subnet is the largest because it carries the per-pod ENIs from the VPC CNI; running out of IPs there is a real failure mode at scale.
+**Internet egress.**
 
-### Internet egress
+NAT Gateways one-per-AZ in prod (the existing POC uses a single NAT for cost — fine for a POC, not for prod). One NAT per AZ removes both the cross-AZ data-transfer charge on every outbound byte and the single point of failure.
 
-- **NAT Gateways** — one per AZ in prod (the existing POC uses a single NAT for cost; production sets `single_nat_gateway = false`). One NAT per AZ avoids a cross-AZ data-transfer charge on every outbound byte and removes a single point of failure.
-- **VPC Endpoints (PrivateLink)** for S3, ECR (api + dkr), STS, Secrets Manager, KMS, CloudWatch Logs, EC2, and SSM. Most pod-to-AWS traffic should never touch a NAT gateway — this is both a cost and a security win.
+**VPC Endpoints (PrivateLink)** for S3, ECR (api + dkr), STS, Secrets Manager, KMS, CloudWatch Logs, EC2, and SSM. Most pod-to-AWS traffic should never traverse a NAT gateway — this is both a cost win and a security win.
 
-### Securing the network
+**Securing the network.**
 
 | Layer | Control |
 |---|---|
-| **Edge** | CloudFront (SPA + API) → AWS WAF (managed rule sets: Core, Known Bad Inputs, SQLi, Bot Control, Rate-based rules) → AWS Shield Standard (free; Shield Advanced once revenue justifies the $3k/mo). |
-| **DNS** | Route 53 public hosted zone in `shared-services`. DNSSEC enabled. Health checks drive failover routing for DR. |
-| **Load balancer** | Internet-facing ALB in the public subnets, provisioned by the **AWS Load Balancer Controller** from Kubernetes `Ingress` resources. TLS terminated at the ALB with ACM-issued, auto-renewed certificates. |
-| **VPC** | Security groups (default-deny, allow-list per tier: ALB→apps, apps→data on 5432 only). NACLs left mostly default — security groups are the strong control. |
-| **East-west in cluster** | Kubernetes `NetworkPolicy` enforced by the VPC CNI's network-policy engine. Default-deny in `prod`, namespace allow-lists. |
-| **Egress** | Phase 2: AWS Network Firewall in the `egress` subnet tier for FQDN-based egress filtering once we have a defined allow-list. |
-| **Visibility** | VPC Flow Logs (all subnets, REJECT + ACCEPT) → S3 in `log-archive` → queryable via Athena. GuardDuty consumes the same logs for threat detection. |
-| **Private API** | EKS API endpoint is private in prod; admin access is via SSO + AWS Systems Manager Session Manager onto a bastion or the IDE itself. The POC currently leaves it public — see [`terraform/README.md`](../terraform/README.md#production-hardening). |
+| Edge | CloudFront → AWS WAF (managed rule sets + rate-based rules on `/api/auth/*`) → Shield Standard (Advanced when revenue justifies $3k/mo). |
+| DNS | Route 53 in `shared-services`, DNSSEC enabled. Health-check-driven failover routing for DR. |
+| Load balancer | Internet-facing ALB in public subnets, provisioned by the AWS Load Balancer Controller from K8s `Ingress`. TLS terminated with ACM-issued, auto-renewed certs. |
+| VPC | Security groups, default-deny per tier: ALB → apps, apps → data on 5432 only. |
+| In-cluster east-west | Kubernetes `NetworkPolicy` enforced by the VPC CNI's policy engine. Default-deny in prod. |
+| Egress filtering | Phase 2: Network Firewall in the egress subnet tier once we have a defined allow-list. |
+| Visibility | VPC Flow Logs → S3 in `log-archive` → queryable via Athena. GuardDuty consumes the same logs. |
+| Private control plane | EKS API endpoint private in prod; admin access via SSO + Session Manager. The POC currently leaves it public — that gets fixed before launch. |
 
 ---
 
-## 4. Compute platform (EKS + Karpenter)
+## COMPUTE
 
-### Cluster topology
+### EKS, Karpenter, and Containers
 
-- **One EKS cluster per workload account** (`innovate-dev`, `innovate-prod`). Cross-environment isolation is at the account boundary, not the namespace boundary — even with strict RBAC, sharing a control plane between dev and prod is a footgun we won't take.
-- **Kubernetes 1.33** today; we follow the n-1 supported version policy and budget one upgrade per quarter.
-- **EKS Access Entries** (modern auth) — no `aws-auth` ConfigMap. SSO permission sets map directly to Kubernetes groups.
+**One EKS cluster per workload account.** Cross-environment isolation is at the account boundary, not the namespace boundary. Even with strict RBAC, sharing a control plane between dev and prod is a footgun I am not willing to take.
 
-### Node groups & scaling
+Kubernetes 1.33 today, with one upgrade per quarter budgeted (EKS supports `n-1`). EKS Access Entries for auth — no `aws-auth` ConfigMap. SSO permission sets map directly to Kubernetes groups.
 
-We use a **two-tier node strategy**, which is what the existing Terraform already implements:
+**Two-tier node strategy.**
 
-1. **System managed node group** — small, stable, On-Demand. Runs the things that *must* exist before Karpenter does: CoreDNS, kube-proxy, the Karpenter controller itself, the AWS Load Balancer Controller, the metrics-server, the EBS CSI controller.
-   - Prod sizing: 3× `m7g.large` (Graviton) On-Demand, one per AZ, so any single-AZ failure leaves quorum for Karpenter and the AWS LBC.
-2. **Karpenter NodePools** — provision every workload node. Configured with:
-   - **Capacity types**: `[spot, on-demand]` — Karpenter picks the cheapest viable option, which is Spot ~95% of the time.
-   - **Architectures**: `[amd64, arm64]` — Graviton-first where the image supports it (most Python/Flask images do). 20–40% better price/performance.
-   - **Instance categories**: `c`, `m`, `r`, generation `>2`.
-   - **Consolidation**: enabled — Karpenter rebalances pods onto fewer nodes during quiet hours, deleting empty nodes within a minute.
-   - **Spot interruption handling**: SQS + EventBridge listens for the 2-minute Spot interruption warning, Rebalance Recommendations, EC2 state changes, and AWS Health events; Karpenter cordons + drains gracefully.
+1. **System managed node group** — small, stable, On-Demand. Runs the things that *must* exist before Karpenter does: CoreDNS, kube-proxy, the Karpenter controller, the AWS Load Balancer Controller, the metrics-server, the EBS CSI controller.
+   Prod sizing: 3× `m7g.large` (Graviton) On-Demand, one per AZ.
+2. **Karpenter NodePools** — provision every workload node, with:
+   - Capacity types `[spot, on-demand]` — Karpenter picks the cheapest viable option, which is Spot ~95% of the time.
+   - Architectures `[amd64, arm64]` — Graviton-first where the image supports it (most Python/Flask images do). 20–40% better price/performance.
+   - Instance categories `c`, `m`, `r`, generation `>2`.
+   - Consolidation enabled — Karpenter rebalances pods onto fewer nodes during quiet hours and deletes empty nodes within a minute.
+   - Spot interruption handled via SQS + EventBridge; Karpenter cordons and drains gracefully on the 2-minute warning.
 
-Separate NodePools by workload class once we have them:
+Separate NodePools by workload class once they exist: `general` (default), `system-critical` (taint for On-Demand-only add-ons), `gpu` (future, for ML inference).
 
-| NodePool | Taints | Used for |
+**Why Karpenter over Cluster Autoscaler + ASGs.** Karpenter looks at pending pods' actual requirements and picks the right instance type from a broad set; node-ready in 60–90 s vs. 2–3 min for ASG-driven scale-out; multi-instance-type Spot pools cut the interruption rate and remove the need to manage five separate node groups for arch/capacity mix.
+
+**Resource allocation hygiene.**
+
+- Requests + limits required on every workload (enforced by Kyverno in prod).
+- HPA on CPU + a custom request-rate metric via the Prometheus adapter.
+- PodDisruptionBudgets so consolidation and node upgrades cannot take a service to zero.
+- `topologySpreadConstraints` on zone so a single-AZ outage degrades but does not kill a service.
+
+**Containerization.**
+
+- Multi-stage Dockerfiles. Frontend builds in `node:22-alpine`, then either serves from `nginx:alpine` or hands off to S3 + CloudFront. Backend uses `python:3.12-slim` with `gunicorn`, non-root user, distroless final stage if dependencies allow.
+- Multi-arch builds via `docker buildx --platform linux/amd64,linux/arm64 --push` so one tag works on both Graviton and x86 nodes.
+- SBOMs generated with `syft`, images signed with `cosign` (keyless via GitHub OIDC). The admission controller in prod rejects unsigned or HIGH-CVE images.
+
+**Registry.** Private ECR in `shared-services`, with cross-account pull policies for the workload accounts. ECR Enhanced Scanning (Inspector-powered) on push. Immutable tags. Lifecycle policy keeps 30 release tags + 200 PR tags.
+
+---
+
+## DATABASE
+
+### Aurora PostgreSQL
+
+I recommend **Amazon Aurora PostgreSQL (provisioned)** for prod and **Aurora Serverless v2** for dev. The rationale is in [Tradeoffs](#tradeoffs).
+
+**Topology.**
+
+| Environment | Shape | Why |
 |---|---|---|
-| `general` (default) | none | Stateless API, frontend assets, batch jobs |
-| `system-critical` | `CriticalAddonsOnly=true:NoSchedule` | Add-ons that need On-Demand only |
-| `gpu` (future) | `nvidia.com/gpu=true:NoSchedule` | ML inference if/when the product needs it |
+| Dev | Aurora Serverless v2, 0.5–2 ACU, auto-pause | Pause-able to $0, cheap |
+| Prod | 1 writer + 2 readers on `db.r7g.large` (Graviton), Multi-AZ | Writes go to the primary; reads distributed via the Aurora reader endpoint |
 
-### Resource allocation
+**Backups, HA, DR.**
 
-- **Requests/limits required** on every workload (enforced by Kyverno policy in prod). Without requests, the scheduler can't bin-pack and Karpenter can't size nodes.
-- **Horizontal Pod Autoscaler** on CPU + custom request-rate metric (via the Prometheus adapter) for the Flask API.
-- **Pod Disruption Budgets** (`minAvailable: 1` or `maxUnavailable: 25%`) so consolidation and node upgrades can't take a service to zero.
-- **Topology spread constraints** — `topologyKey: topology.kubernetes.io/zone, maxSkew: 1` — so a single-AZ outage degrades but doesn't kill a service.
+- **Multi-AZ HA.** Aurora replicates storage across 3 AZs by default. With one reader in a different AZ from the writer, failover is ~30 s, mostly DNS-bound. With RDS Proxy in front, clients see a brief pause rather than a connection reset.
+- **Continuous backup.** 35-day PITR retention (the max). No impact on the writer.
+- **Monthly snapshots.** Retained 1 year, copied to `log-archive` for compliance.
+- **Cross-region DR.** Aurora Global Database with the secondary in `us-west-2`. Typical RPO < 1 s, RTO ~1 min via a runbook + Route 53 health-check failover. Storage-layer replication, so lag does not balloon under write pressure the way logical replication does.
+- **Logical backup.** Nightly `pg_dump` to S3 with a separate KMS key. Aurora's continuous backup recovers from infrastructure failures, not from "we ran the wrong UPDATE."
+- **Restore drill.** Quarterly: restore the latest snapshot to a scratch cluster, run schema-level validation, tear down. Documented in the runbook.
 
-### Why Karpenter over Cluster Autoscaler + ASGs
+**Connection and security.**
 
-- **Bin-packing** — Karpenter looks at pending pods' actual requirements and picks the right instance type from a broad set, rather than scaling a fixed-shape ASG.
-- **Latency** — node-ready in 60–90 s vs. 2–3 min for ASG-driven scale-out.
-- **Cost** — multi-instance-type Spot pools cut interruption rate and let us blend Graviton + x86 without managing five separate node groups.
-- **Operations** — no `aws-node-termination-handler` to run separately; Karpenter handles drain natively.
+- Lives only in the data subnets, no public endpoint, no NAT route. SG accepts 5432 only from the apps SG.
+- Encryption at rest with a per-environment customer-managed KMS key. TLS in transit with `sslmode=verify-full`.
+- Credentials in **AWS Secrets Manager** with 30-day automatic rotation. The Flask app reads via the Secrets Store CSI Driver — no DB password in a Kubernetes Secret or env var.
+- `pgaudit` enabled for DDL + role changes + DML on PII tables; logs to CloudWatch then to S3 in `log-archive`.
+- IAM auth for human DB access: engineers assume an SSO role, get a 15-minute IAM token, connect via Session Manager port forward. No shared `postgres` password.
 
 ---
 
-## 5. Containerization & CI/CD
+## CI/CD
 
-### Image build
-
-- **Multi-stage Dockerfiles** for both services.
-  - Frontend: `node:22-alpine` builder → `nginx:alpine` runtime serving the static SPA, or hand off the build artifact to an **S3 + CloudFront** static-site origin (preferred at scale — the SPA shouldn't burn pod CPU).
-  - Backend (Flask): `python:3.12-slim` base, non-root user, `gunicorn` + `uvicorn` workers, distroless final stage if dependencies allow.
-- **Multi-arch builds** — `docker buildx build --platform linux/amd64,linux/arm64 --push` so a single tag works on both Graviton and x86 nodes (the existing Karpenter NodePool already supports both).
-- **SBOM + signature** — generated with `syft` and signed with `cosign` (keyless via GitHub OIDC). Admission controller in prod rejects unsigned images.
-
-### Registry
-
-- **Amazon ECR (private)** in `innovate-shared-services`, replicated read-only to the workload accounts' regions.
-- **Image scanning on push** (ECR enhanced scanning, powered by Inspector) — CVEs above HIGH block promotion to prod.
-- **Immutable tags** — once a tag is pushed it can't be overwritten. Releases are pinned by digest, not by `latest`.
-- **Lifecycle policy** — keep last 30 release tags + last 200 PR/branch tags, expire the rest.
-
-### CI/CD pipeline
+### Build to Production
 
 ```
                  ┌────────────────┐
@@ -193,125 +244,129 @@ Separate NodePools by workload class once we have them:
                          │
                          ▼
                  ┌────────────────┐
-                 │   Argo CD      │  in each cluster — pull-based
+                 │   Argo CD      │  in cluster — pull-based
                  └───────┬────────┘
                          ▼
                   EKS (dev / prod)
 ```
 
-- **GitHub Actions** for CI (test, build, scan, sign, push). It assumes an AWS role via OIDC — no long-lived AWS keys in GitHub.
+- **GitHub Actions** for CI. Tests, multi-arch buildx, ECR scan, `cosign` sign, push. Assumes an AWS role via OIDC — zero long-lived AWS keys in GitHub.
 - **Argo CD** for CD, one instance per cluster, pull-based. CI's job ends at "ECR has a signed image at digest X"; Argo notices the manifest bump in the GitOps repo and reconciles.
-- **Promotion**: dev auto-syncs from `main`. Prod requires a PR against `clusters/prod/` in the GitOps repo, approved by a second engineer.
-- **Database migrations**: Alembic, run as a `Job` triggered by Argo's `PreSync` hook. Migrations are forward-compatible (expand → migrate code → contract) so rollbacks never need to undo a schema change.
+- **Promotion.** Dev auto-syncs from `main`. Prod requires a PR against `clusters/prod/` in the GitOps repo, approved by a second engineer.
+- **Database migrations.** Alembic, run as a Job via Argo's `PreSync` hook. Migrations are forward-compatible (expand → migrate code → contract) so rollbacks never need to undo a schema change.
 
 ---
 
-## 6. Database (Aurora PostgreSQL)
+## SECURITY
 
-### Recommendation: Amazon Aurora PostgreSQL (provisioned)
-
-**Why Aurora over RDS for PostgreSQL or self-managed:**
-
-- **Storage** — Aurora's storage layer is decoupled from compute, replicates 6 ways across 3 AZs, and auto-grows to 128 TiB. Failover doesn't require an EBS snapshot or volume re-attach; it's a DNS flip averaging ~30 s.
-- **Read scaling** — Up to 15 read replicas with sub-100 ms replication lag, all sharing the same storage. Adding a replica is a control-plane operation, not a `pg_basebackup`.
-- **Backup performance** — Continuous backup to S3, no impact on the writer. Point-in-time restore to any second in the retention window.
-- **Global Database** — Cross-region replication with typical lag <1 s; promote a secondary region in ~1 minute for DR.
-- **Cost vs. self-managed** — A 3-person startup will not run Postgres better than RDS/Aurora can. The premium over RDS Postgres is real but small relative to the engineering time saved on patching, replication, and failover automation.
-
-**Why not Aurora Serverless v2 for prod (yet):** Serverless v2 is excellent for dev/staging and for prod once we have a steady load profile. For initial launch we use **provisioned** (`db.r7g.large`, Graviton) so we have predictable performance and can rightsize from real metrics. Serverless v2 becomes attractive when traffic is bursty or predictably diurnal — Phase 2.
-
-### Topology
-
-| Environment | Cluster shape | Why |
-|---|---|---|
-| Dev | 1× `db.t4g.medium` Aurora Serverless v2 (0.5–2 ACU) | Pause-able, cheap |
-| Prod | 1 writer + 2 readers on `db.r7g.large` (Graviton), Multi-AZ | Writes go to the primary; reads distributed via the Aurora reader endpoint |
-
-### Backups, HA, DR
-
-- **Multi-AZ HA** — Aurora replicates storage across 3 AZs by default. With at least one reader in a different AZ from the writer, failover is automatic and ~30 s.
-- **Automated backups** — 35-day retention (the max), continuous PITR.
-- **Manual snapshots** — Monthly, retained 1 year, copied to `log-archive` for compliance.
-- **Cross-region DR** — **Aurora Global Database** with the secondary in `us-west-2`. RPO < 1 s (typical), RTO < 5 min (manual promotion via runbook + Route 53 health check failover).
-- **Logical backup** — Nightly `pg_dump` to S3 in `log-archive` (encrypted with a different KMS key) as a defense against logical corruption — Aurora's continuous backup recovers from infrastructure failures but not from "we ran the wrong UPDATE."
-- **Restore drill** — Quarterly: restore the latest snapshot to a scratch cluster, run schema-level validation, tear down. Recorded in the runbook.
-
-### Connection & security
-
-- **Network**: lives only in the `data` subnets; no public endpoint, no NAT route. Security group allows port 5432 only from the apps SG.
-- **Encryption**: at rest with a customer-managed KMS key in the workload account; in transit with TLS (`sslmode=verify-full`, RDS CA bundle baked into the image).
-- **Credentials**: stored in **AWS Secrets Manager** with automatic rotation every 30 days. The app reads the secret via the **Secrets Store CSI Driver** — no DB password ever appears in a Kubernetes Secret or env var.
-- **Auditing**: PostgreSQL audit extension (`pgaudit`) enabled for DDL + role changes + selected DML on PII tables; logs to CloudWatch and then S3 in `log-archive`.
-- **IAM auth** for human access to the DB (engineers assume an SSO role, get a 15-minute IAM token, connect via Session Manager port forward). No shared `postgres` password handed around.
-
----
-
-## 7. Security & compliance posture
+### Defense in Depth
 
 Driven by "sensitive user data is handled."
 
-- **Identity** — IAM Identity Center for humans, IRSA / Pod Identity for workloads. No static keys.
-- **Encryption** — KMS customer-managed keys per environment: one for Aurora, one for S3 (per bucket where it matters), one for Secrets Manager, one for EBS. Key policies allow only the intended account + role.
-- **Secrets** — AWS Secrets Manager (DB creds, third-party API keys) with rotation. No `.env` files in images.
-- **Threat detection** — GuardDuty (S3, EKS, RDS, Malware, Runtime Monitoring) in every account, findings aggregated to the `security` account.
-- **Compliance posture** — AWS Config + Security Hub with the AWS Foundational + CIS + PCI DSS rule packs (PCI is a good baseline even pre-PCI scope).
-- **Audit** — CloudTrail org trail to `log-archive` with Object Lock (compliance mode, 7-year retention).
-- **Edge** — WAF + Shield Standard at CloudFront. Managed rules + a custom rate-based rule on `/api/auth/*`.
-- **Image supply chain** — ECR scan-on-push, `cosign` signatures, admission controller (Kyverno or Sigstore policy-controller) rejecting unsigned or HIGH-CVE images in prod.
-- **Pod security** — `PodSecurityAdmission` enforcing the `restricted` profile on workload namespaces; baseline elsewhere. Kyverno for organization-specific rules (mandatory labels, image registries, resource requests).
-- **PII handling** — Data classification labels on every table; pgaudit logs DML on PII tables; field-level encryption for the highest-sensitivity columns (e.g. SSN, payment) using a KMS-backed envelope-encryption helper in the Flask app.
+- **Identity.** IAM Identity Center for humans, IRSA / Pod Identity for workloads. No static keys.
+- **Encryption.** KMS customer-managed keys per environment, one per service class (Aurora, S3, Secrets Manager, EBS). Key policies allow only the intended account and role. CloudTrail records every key use.
+- **Secrets.** AWS Secrets Manager with rotation. No `.env` files in images.
+- **Threat detection.** GuardDuty (S3, EKS, RDS, Malware, Runtime Monitoring) in every account, findings aggregated to `security`.
+- **Posture.** AWS Config + Security Hub with the AWS Foundational + CIS + PCI DSS rule packs.
+- **Audit.** CloudTrail org trail to `log-archive` with Object Lock (compliance mode, 7-year retention).
+- **Edge.** WAF + Shield Standard at CloudFront. Managed rules + a custom rate-based rule on `/api/auth/*`.
+- **Image supply chain.** ECR scan-on-push, `cosign` signatures, admission controller (Kyverno) rejecting unsigned or HIGH-CVE images in prod.
+- **Pod security.** PodSecurityAdmission `restricted` profile on workload namespaces. Kyverno for org-specific rules (mandatory labels, image registries, requests).
+- **PII handling.** Data classification labels per table; pgaudit logs DML on PII tables; field-level KMS envelope encryption for the highest-sensitivity columns (SSN, payment) inside the Flask app.
 
 ---
 
-## 8. Observability
+## OBSERVABILITY
 
-- **Metrics** — Amazon Managed Prometheus + Amazon Managed Grafana. Container Insights for EKS-level metrics. Custom app metrics via the Prometheus Python client.
-- **Logs** — `fluent-bit` DaemonSet ships container logs to CloudWatch Logs; long-retention copy to S3 in `log-archive`.
-- **Traces** — AWS Distro for OpenTelemetry (ADOT) → AWS X-Ray. Flask auto-instrumented; trace IDs propagated through the ALB.
-- **Synthetic** — CloudWatch Synthetics canaries hit `/healthz` and one critical user-journey endpoint every minute, from two regions.
-- **Alerts** — Alertmanager → PagerDuty for prod, Slack for dev. Burn-rate alerts on SLOs (availability 99.9%, p95 latency 300 ms) — not threshold alerts on raw CPU.
+### How I'd Know Things Are Working
+
+- **Metrics** — Amazon Managed Prometheus + Amazon Managed Grafana. Container Insights for EKS metrics. Custom app metrics via the Prometheus Python client.
+- **Logs** — `fluent-bit` DaemonSet ships container logs to CloudWatch; long-retention copy to S3 in `log-archive`.
+- **Traces** — AWS Distro for OpenTelemetry → X-Ray. Flask auto-instrumented; trace IDs propagated through the ALB.
+- **Synthetic** — CloudWatch Synthetics canaries on `/healthz` and one critical user-journey endpoint, every minute, from two regions.
+- **Alerting** — Alertmanager → PagerDuty for prod, Slack for dev. SLO burn-rate alerts (availability 99.9%, p95 latency 300 ms) — not threshold alerts on raw CPU.
+
+Datadog is a reasonable alternative to the AWS-native stack and would consolidate metrics + logs + traces + APM into one product; the tradeoff is cost (especially at scale) vs. tighter AWS-native integration. I'd start with the AWS stack and migrate to Datadog only if the operator experience justifies it.
 
 ---
 
-## 9. Cost posture & growth roadmap
+## COST AND ROADMAP
 
-### Initial monthly cost estimate (us-east-1, hundreds of users/day)
+### Starting Small, Scaling Up
+
+**Initial monthly estimate (us-east-1, hundreds of users/day):**
 
 | Component | Monthly |
 |---|---|
-| EKS control plane (2 clusters: dev + prod) | ~$144 |
-| Worker nodes (2× `m7g.large` system + Karpenter Spot for apps) | ~$120 |
-| Aurora prod (`db.r7g.large` writer + 1 reader, Multi-AZ) | ~$430 |
+| EKS control plane (2 clusters) | ~$144 |
+| Worker nodes (system + Karpenter Spot) | ~$120 |
+| Aurora prod (writer + 1 reader, Multi-AZ) | ~$430 |
 | Aurora dev (Serverless v2, mostly paused) | ~$30 |
-| NAT × 3 AZs (prod) + 1 (dev) | ~$160 |
+| NAT × 3 AZs prod + 1 dev | ~$160 |
 | ALB + CloudFront + WAF | ~$60 |
 | S3 / ECR / CloudWatch / Secrets Manager | ~$60 |
 | GuardDuty / Security Hub / Config | ~$80 |
 | **Approx total** | **~$1,100 / mo** |
 
-This is realistic for a startup with a real production environment; it is *not* the cheapest possible setup. The cheapest setup (single NAT, single-AZ Aurora, no WAF, no GuardDuty) would be ~$400/mo but is not appropriate for "sensitive user data."
+This is realistic for a startup with a *real* production environment. The cheapest possible setup (single NAT, single-AZ Aurora, no WAF, no GuardDuty) would be ~$400/mo, but it would not be appropriate for sensitive user data.
 
-### Levers as we grow
+**Levers as we grow:** Savings Plans on workers, RIs on Aurora, Graviton everywhere (already default), Spot for everything stateless (already default), VPC endpoints to cut NAT egress, Serverless v2 for prod once a load profile emerges.
 
-- **Savings Plans** once steady-state worker spend stabilizes (1-year compute SP covers EKS workers; typical savings 30–40%).
-- **Reserved Instances** for the Aurora writer + reader once we're confident in the instance class (1-year RI: ~35% off, 3-year: ~55%).
-- **Graviton everywhere** — already the default; ~20% cheaper than equivalent x86.
-- **Spot for everything that's stateless** — already the default via Karpenter; expect 60–70% off On-Demand for compute.
-- **VPC endpoints** for S3 / ECR / Secrets / KMS — cuts NAT data-transfer by ~70% at scale.
-- **Aurora Serverless v2 for prod** once we have a clear bursty/diurnal pattern.
-
-### Growth roadmap
+**Growth roadmap:**
 
 | Phase | Trigger | Action |
 |---|---|---|
-| **Launch** | Today → first paying users | Single region (`us-east-1`), 3 AZs, prod + dev accounts |
-| **Phase 2** | ~10k DAU | Promote staging to its own account; enable Aurora Global Database to `us-west-2`; Shield Advanced if attacked |
-| **Phase 3** | ~100k DAU | Active-active read in `us-west-2` via Route 53 latency routing; Aurora reader endpoints per region; CDN-cache more aggressively |
-| **Phase 4** | ~1M DAU | Per-tenant or per-region sharding of Postgres; consider DynamoDB for the highest-volume access patterns; dedicated `data` account for analytics (Glue/Redshift/Athena) |
+| Launch | Today | Single region, 3 AZs, prod + dev accounts |
+| Phase 2 | ~10k DAU | Promote staging to its own account; enable Aurora Global Database to `us-west-2`; Shield Advanced if attacked |
+| Phase 3 | ~100k DAU | Active-active read in `us-west-2` via Route 53 latency routing; Aurora reader endpoints per region |
+| Phase 4 | ~1M DAU | Per-tenant or per-region Postgres sharding; consider DynamoDB for highest-volume access patterns; dedicated `data` account for analytics |
 
 ---
 
-## 10. High-level diagrams
+## TRADEOFFS
+
+### Decisions I Made and Why
+
+Every design has tradeoffs. I want to be transparent about the ones I made.
+
+**AWS over GCP.** Aurora's cross-region DR (storage-level Global Database) is materially better than GCP's logical-replication equivalents. Aurora Serverless v2 with auto-pause has no GCP equivalent for non-prod cost. The existing Terraform is already on AWS. The tradeoff: AlloyDB on GCP has a similar disaggregated-storage architecture and is a legitimate competitor, but the three points above plus stack coherence tipped it for AWS.
+
+**Six accounts on day one, not one.** A 5-person startup could run on a single account today, and the multi-account setup is genuine extra work at launch. The tradeoff: zero ops cost later, when the team grows or the auditor arrives. Retrofitting account boundaries onto a running system is one of the most painful migrations in AWS.
+
+**Provisioned Aurora for prod, not Serverless v2.** Serverless v2 is great for unpredictable bursty workloads and dev environments. The tradeoff: for launch I want predictable performance numbers and the ability to right-size from real metrics. Switching to Serverless v2 once a load profile emerges is a control-plane operation.
+
+**Argo CD (GitOps) instead of `kubectl apply` from CI.** GitOps adds a second repo and a second moving part. The tradeoff: a declarative source of truth that survives team turnover, automatic drift detection, easy multi-cluster, and pull-based deploys that work without giving CI prod credentials. Worth the complexity.
+
+**Karpenter, not Cluster Autoscaler.** Karpenter is newer and the operator skillset is less common. The tradeoff: significantly better bin-packing, faster node-ready time, native Spot + multi-arch + multi-instance support, and one component instead of CAS + node-termination-handler + ASGs.
+
+**EKS, not Fargate.** Fargate is simpler to run but more expensive at scale, has cold-start penalties, and is less flexible for sidecars and DaemonSets. The tradeoff: more cluster operations work in exchange for cost control and flexibility at the millions-of-users scale.
+
+**AWS-native security stack (KMS / WAF / GuardDuty / Security Hub) over third-party tools.** A best-of-breed stack (Wiz + Snyk + a SIEM + a CSPM) might be marginally stronger. The tradeoff: each tool is a contract, an integration, an agent, and a piece of audit scope. For a small team handling sensitive data, AWS-native is meaningfully less work and is already in scope for AWS's own SOC 2 / ISO 27001 / PCI / HIPAA reports.
+
+**Staging as a namespace, not an account, initially.** Less isolation than a dedicated account. The tradeoff: Control Tower's Account Factory makes adding the `staging` account a one-day operation when the trigger fires (a release manager, a regulator, or a real risk of cross-contamination). Provisioning it on day one for an audience of three engineers is overkill.
+
+**Google Workspace / Entra ID as the SSO identity source, not Okta on day one.** Okta is the better long-term IdP. The tradeoff: $6–15/user/month for a tool that mostly sits idle at 5 people. Identity Center stays in place; the IdP behind it is swappable. Migrate to Okta once SaaS-sprawl makes it worthwhile.
+
+---
+
+## SCOPE
+
+### What I Did Not Cover
+
+This document focuses on the foundational platform — accounts, network, compute, database, CI/CD, and the security/observability layers around them. Given more time, I would also address:
+
+- **Detailed tool selection and cost comparison** — Datadog vs. AWS-native observability, Kyverno vs. OPA Gatekeeper, ArgoCD vs. Flux. These should be evaluated against a defined budget and operator experience, not picked from the architecture document.
+- **Analytics and data warehouse** — Glue / Redshift / Athena, a dedicated `data` account, and the ingest pipeline from Aurora. Becomes important around Phase 3.
+- **Async job runner** — SQS + EKS workers or Step Functions for background jobs (email, KYC processing, report generation). Likely needed before launch.
+- **Transactional email and notifications** — SES + an email-delivery monitoring story.
+- **Caching layer** — ElastiCache (Redis) for session state and hot reads. Trigger is when Aurora reader CPU becomes the bottleneck.
+- **DR runbook details** — who runs which command in what order during a regional failover. Belongs in a runbook, not an architecture document.
+- **Compliance scoping** — which specific framework (SOC 2 Type II, PCI DSS, HIPAA) Innovate is going for, what's in scope, and what BAAs are required.
+- **Threat model** — STRIDE / attack-tree analysis for the auth flow and the sensitive-data paths. The architecture supports it; the analysis itself is its own exercise.
+
+---
+
+## HIGH-LEVEL DIAGRAMS
 
 ### HDL 1 — Multi-account organization
 
@@ -339,7 +394,6 @@ flowchart TB
     PROD -. CloudTrail / Flow Logs .-> LOG
     SHARED -. ECR pull .-> DEV
     SHARED -. ECR pull .-> PROD
-    SEC -. findings aggregated .-> SEC
 ```
 
 ### HDL 2 — Production runtime (single region, `us-east-1`)
@@ -412,34 +466,10 @@ flowchart TB
     API --> XRAY
 ```
 
-### HDL 3 — CI/CD flow
-
-```mermaid
-flowchart LR
-    DEV([Developer])
-    GH[GitHub repo<br/>app code]
-    GHA[GitHub Actions<br/>test → buildx → scan → cosign]
-    OIDC{{OIDC → AWS IAM role}}
-    ECR[(ECR<br/>signed, multi-arch images)]
-    GITOPS[GitHub repo<br/>k8s manifests]
-    ARGO[Argo CD<br/>in cluster]
-    K8S[EKS cluster]
-    AUR[(Aurora<br/>Alembic migration job)]
-
-    DEV --> GH --> GHA
-    GHA --> OIDC --> ECR
-    GHA -- bump image digest --> GITOPS
-    GITOPS -- pull --> ARGO
-    ARGO --> K8S
-    ARGO -- PreSync hook --> AUR
-```
-
 ---
 
-## Appendix — assumptions & open questions
+## DISCLOSURE
 
-- **Region**: assumed primary `us-east-1`, DR `us-west-2`. Confirm based on user geography and any data-residency requirements.
-- **Compliance scope**: design satisfies the spirit of SOC 2 / PCI DSS / HIPAA but does not include controls specific to any one of them (BAAs, scoped accounts, etc.). Confirm which regimes actually apply.
-- **Engineer count**: design assumes 3–10 engineers initially. At 1–2 engineers, drop dev to a namespace in prod and skip Argo CD; at 20+ add a dedicated platform team and a `staging` account.
-- **SLA**: assumed 99.9% availability target. 99.95%+ would push us into active-active multi-region sooner.
-- **Out of scope** for v1.0: data warehouse / analytics stack, async job runner (would be SQS + EKS or Step Functions), email / notifications stack, mobile clients.
+### AI Usage
+
+AI (Claude) was used for drafting and refining this document — structure, prose cleanup, and surfacing edge cases I might have missed. The architectural decisions, the tradeoff reasoning, and the framing of constraints are my own thinking; AI did the writing, I did the design.
