@@ -1,0 +1,35 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hello-arm64
+  labels:
+    app: hello-arm64
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: hello-arm64
+  template:
+    metadata:
+      labels:
+        app: hello-arm64
+    spec:
+      # Pins this workload to Graviton (arm64) instances.
+      # Karpenter launches an arm64 node from the c/m/r 7g families (or newer).
+      nodeSelector:
+        kubernetes.io/arch: arm64
+      containers:
+        - name: nginx
+          # The nginx image on ECR Public is multi-arch — same tag works on
+          # both amd64 and arm64. Make sure any custom images you deploy are
+          # built for arm64 (e.g. `docker buildx build --platform linux/arm64`).
+          image: public.ecr.aws/nginx/nginx:1.27
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          ports:
+            - containerPort: 80

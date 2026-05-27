@@ -1,0 +1,32 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hello-x86
+  labels:
+    app: hello-x86
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: hello-x86
+  template:
+    metadata:
+      labels:
+        app: hello-x86
+    spec:
+      # The only line that pins this workload to x86 instances.
+      # Karpenter sees the request and launches an amd64 node from the NodePool.
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      containers:
+        - name: nginx
+          image: public.ecr.aws/nginx/nginx:1.27
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          ports:
+            - containerPort: 80
