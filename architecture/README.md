@@ -86,9 +86,11 @@ I am proposing **AWS Organizations with Control Tower** and six accounts on day 
 | `innovate-management` | Root | Org root, billing consolidation, Control Tower, IAM Identity Center. No workloads. |
 | `innovate-security` | Security | Delegated admin for GuardDuty / Security Hub / Config / IAM Access Analyzer. Read-only auditor role. |
 | `innovate-log-archive` | Security | Immutable destination for CloudTrail, VPC Flow Logs, ELB / WAF / Aurora logs. Object Lock + cross-region replication. |
-| `innovate-shared-services` | Shared | ECR registries, Route 53 public zones, CloudFront + its ACM cert, build runners, internal tooling. |
+| `innovate-shared-services` | Shared | ECR registries, Route 53 public hosted zone for `innovate.com`, build runners, internal tooling. CloudFront + ACM certs live in the workload account that uses them — see note below. |
 | `innovate-dev` | Workloads/Non-Prod | Dev EKS cluster + Aurora dev. Generous developer access. Staging lives here as a namespace until it earns its own account. |
 | `innovate-prod` | Workloads/Prod | Production EKS + Aurora. Access via SSO + break-glass + change tickets. |
+
+**DNS, CloudFront, and ACM split.** `shared-services` owns the public hosted zone for `innovate.com` because there is only one of those in the world. Subdomains (`api.innovate.com`, `dev.innovate.com`) are **delegated** to their owning workload account via NS records, so each account manages its own subdomain freely. **CloudFront and its ACM cert live in the workload account** that serves the traffic (prod for prod). The only cross-account interaction at deploy time is a one-time ACM validation record in the apex zone, plus the apex `A`-ALIAS to the CloudFront distribution — both stable, both done once.
 
 **Why six accounts, not one.**
 
@@ -379,7 +381,7 @@ flowchart TB
             LOG["innovate-log-archive<br/>(CloudTrail, VPC FL, audit S3<br/>Object Lock 7y)"]
         end
         subgraph SHARED_OU["Shared OU"]
-            SHARED["innovate-shared-services<br/>(ECR, Route 53, ACM,<br/>build runners)"]
+            SHARED["innovate-shared-services<br/>(ECR, Route 53 apex zone,<br/>build runners)"]
         end
         subgraph WL_OU["Workloads OU"]
             DEV["innovate-dev<br/>(EKS dev + Aurora dev)"]
@@ -402,13 +404,13 @@ flowchart TB
 flowchart TB
     USER([Users])
 
-    subgraph EDGE["Edge (global)"]
-        R53[Route 53<br/>DNSSEC]
-        CF[CloudFront<br/>SPA + API]
-        WAF[AWS WAF<br/>+ Shield Std]
+    subgraph SHARED["innovate-shared-services"]
+        R53[Route 53<br/>innovate.com zone<br/>DNSSEC]
     end
 
     subgraph PROD_ACCT["innovate-prod account — us-east-1"]
+        CF[CloudFront<br/>SPA + API<br/>+ ACM cert]
+        WAF[AWS WAF<br/>+ Shield Std]
         subgraph VPC["VPC 10.20.0.0/16 — 3 AZs"]
             subgraph PUB["Public subnets (per AZ)"]
                 ALB[Application<br/>Load Balancer]
